@@ -1,0 +1,11 @@
+[project]
+name = "inspectagent"
+version = "0.1.0"
+description = "Agentic visual inspection with OpenCV 5 on AWS Graviton"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

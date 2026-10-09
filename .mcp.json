@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "inspectagent": {
+      "type": "stdio",
+      "command": "${INSPECTAGENT_PYTHON:-.venv/Scripts/python.exe}",
+      "args": ["-m", "inspectagent.mcp_server"],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "INSPECTAGENT_LOG_LEVEL": "WARNING"
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+runs/
+models/**/*.npz
+models/*.onnx
+results/cache/
+*.tar
+*.zip
+.env
+deploy/aws/.build/
+media/raw/

@@ -1,0 +1,9 @@
+# DEV-ONLY dependencies of scripts/export_backbone.py (regenerates models/backbone_resnet18.onnx).
+# NOT runtime dependencies: inference runs through cv2.dnn only (see requirements.txt).
+# CPU wheels from the PyTorch index; verified on Windows x86-64 / Python 3.13 (2026-10-09):
+#   uv pip install --python .venv/Scripts/python.exe torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Reproduce from this file (the export also uses onnx from requirements-dev.txt):
+#   uv pip install --python .venv/Scripts/python.exe -r requirements-export.txt
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+torchvision==0.29.1+cpu

@@ -1,0 +1,11 @@
+# Runtime dependencies (direct, pinned). Full transitive lock: requirements.lock.txt
+opencv-contrib-python-headless==5.0.0.93
+numpy==2.5.3
+fastapi==0.143.0
+uvicorn==0.54.0
+mangum==0.22.0
+pydantic==2.14.0
+python-multipart==0.0.32
+jsonschema==4.26.0
+boto3==1.43.110
+mcp==2.3.0

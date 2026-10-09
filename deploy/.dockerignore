@@ -1,0 +1,35 @@
+# InspectAgent build context rules (allow-list).
+#
+# Docker only reads .dockerignore from the root of the build context, so:
+#   * CodeBuild (deploy/aws/buildspec.yml) copies this file to ./.dockerignore before `docker build`;
+#   * deploy/aws/deploy.py applies exactly these rules (Docker semantics) when it zips the source;
+#   * for a local build run:  cp deploy/.dockerignore .dockerignore
+#     then  docker build -f deploy/Dockerfile.lambda .   (or -f deploy/Dockerfile for the generic image).
+#
+# Exclude everything, then re-include only what the images need. Later rules win.
+*
+!inspectagent
+!samples
+!models
+!results
+!scripts/__init__.py
+!scripts/bench_cv.py
+!requirements*.txt
+!deploy
+
+# Never ship caches, local runs, build outputs, archives or secrets.
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.ipynb_checkpoints
+**/.DS_Store
+**/Thumbs.db
+**/.env
+**/.env.*
+**/*.zip
+**/*.tar
+**/*.tar.gz
+results/cache
+deploy/aws/.build

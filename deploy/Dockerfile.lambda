@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+# InspectAgent - AWS Lambda container image (FastAPI + Mangum).
+# Built natively for linux/arm64 (Graviton) by CodeBuild ARM; the same file builds linux/amd64 for the
+# x86 comparison function. Build context = repository root, filtered by deploy/.dockerignore:
+#   cp deploy/.dockerignore .dockerignore && docker build -f deploy/Dockerfile.lambda -t inspectagent:lambda .
+FROM public.ecr.aws/lambda/python:3.13
+
+ARG GIT_SHA=unknown
+ARG IMAGE_TAG=dev
+LABEL org.opencontainers.image.title="InspectAgent" \
+      org.opencontainers.image.description="Agentic visual inspection with OpenCV 5 on AWS Lambda" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.version="${IMAGE_TAG}"
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    INSPECTAGENT_MODELS_DIR=/var/task/models \
+    INSPECTAGENT_SAMPLES_DIR=/var/task/samples \
+    INSPECTAGENT_RESULTS_DIR=/var/task/results \
+    INSPECTAGENT_LOCAL_STORAGE_DIR=/tmp/inspectagent \
+    INSPECTAGENT_IMAGE_TAG=${IMAGE_TAG} \
+    INSPECTAGENT_GIT_SHA=${GIT_SHA}
+
+# Dependencies first (cached layer): the fully pinned transitive lock, binary wheels only
+# (manylinux_2_28 wheels exist for aarch64 and x86_64; the base image is Amazon Linux 2023, glibc 2.34).
+COPY requirements.lock.txt requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir --only-binary=:all: -r ${LAMBDA_TASK_ROOT}/requirements.lock.txt \
+    && python -c "import cv2, numpy; print('OpenCV', cv2.__version__, 'numpy', numpy.__version__)"
+
+# Application code, curated samples, model bundles and evaluation results (Results tab / GET /api/metrics).
+COPY inspectagent/ ${LAMBDA_TASK_ROOT}/inspectagent/
+COPY scripts/ ${LAMBDA_TASK_ROOT}/scripts/
+COPY samples/ ${LAMBDA_TASK_ROOT}/samples/
+COPY models/ ${LAMBDA_TASK_ROOT}/models/
+COPY results/ ${LAMBDA_TASK_ROOT}/results/
+
+# Pre-compile bytecode (the Lambda filesystem is read-only at runtime) and fail the build early if the
+# handler cannot be imported. Storage is forced to "local" (/tmp) and model warm-up is skipped for this
+# check only; the function itself runs with INSPECTAGENT_STORAGE=aws from the CloudFormation template.
+RUN python -m compileall -q ${LAMBDA_TASK_ROOT}/inspectagent ${LAMBDA_TASK_ROOT}/scripts \
+    && cd ${LAMBDA_TASK_ROOT} \
+    && INSPECTAGENT_STORAGE=local INSPECTAGENT_WARMUP=0 AWS_DEFAULT_REGION=us-east-1 \
+       python -c "import inspectagent.api.lambda_handler as h; assert callable(h.handler); print('handler import ok')"
+
+CMD ["inspectagent.api.lambda_handler.handler"]

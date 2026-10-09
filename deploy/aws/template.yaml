@@ -1,0 +1,619 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  InspectAgent - agentic visual inspection with OpenCV 5 on AWS Graviton (Lambda arm64
+  container + Function URL, S3, DynamoDB, ECR, CodeBuild ARM, Amazon Bedrock).
+  Deployed in two phases by deploy/aws/deploy.py: first without an image (storage, registry
+  and build projects), then again with the ImageUri produced by CodeBuild.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Naming}
+        Parameters: [StackPrefix]
+      - Label: {default: Container images (set by deploy.py after the CodeBuild run)}
+        Parameters: [ImageUri, ImageUriX86]
+      - Label: {default: Runtime}
+        Parameters: [BedrockModelId, ReservedConcurrency, AllowMarketplaceSubscribe]
+      - Label: {default: Build}
+        Parameters: [BuildComputeType]
+
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: inspectagent
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+    ConstraintDescription: 2-21 chars, lowercase letters, digits and hyphens, starting with a letter.
+    Description: Prefix for physical resource names (bucket, table, repository, functions, log groups).
+  ImageUri:
+    Type: String
+    Default: ''
+    Description: >-
+      arm64 Lambda container image (ECR URI, preferably digest-pinned repo@sha256:...).
+      Empty = phase 1 (no function yet).
+  ImageUriX86:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional x86_64 image for the Graviton-vs-x86 comparison function (<prefix>-x86).
+      Empty = no x86 function.
+  BedrockModelId:
+    Type: String
+    Default: ''
+    Description: >-
+      Amazon Bedrock model or inference-profile id used by the Bedrock planner
+      (e.g. us.anthropic.claude-...). Empty = Bedrock disabled (rule planner only, no Bedrock IAM permissions).
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 100
+    Description: >-
+      Reserved concurrent executions per function (cost / abuse cap for the public URL).
+      0 = do not reserve (needed on new accounts whose concurrency quota is 10).
+  AllowMarketplaceSubscribe:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: >-
+      Grant aws-marketplace:ViewSubscriptions/Subscribe so the function can auto-enable a Marketplace-backed
+      Bedrock model on first use. Default false (no Marketplace permissions; enable model access once in the console).
+  BuildComputeType:
+    Type: String
+    Default: BUILD_GENERAL1_SMALL
+    AllowedValues: [BUILD_GENERAL1_SMALL, BUILD_GENERAL1_LARGE]
+    Description: CodeBuild compute size for the image builds (the build mostly downloads wheels).
+
+Conditions:
+  HasImage: !Not [!Equals [!Ref ImageUri, '']]
+  HasX86Image: !Not [!Equals [!Ref ImageUriX86, '']]
+  HasBedrock: !Not [!Equals [!Ref BedrockModelId, '']]
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+  AllowMarketplace: !Equals [!Ref AllowMarketplaceSubscribe, 'true']
+  BedrockMarketplace: !And [!Condition HasBedrock, !Condition AllowMarketplace]
+
+Resources:
+  # --------------------------------------------------------------------------------------------
+  # Storage: artifacts bucket (traces/, artifacts/, source/) and the single-table DynamoDB store.
+  # --------------------------------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${StackPrefix}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-traces
+            Status: Enabled
+            Prefix: traces/
+            ExpirationInDays: 30
+          - Id: expire-artifacts
+            Status: Enabled
+            Prefix: artifacts/
+            ExpirationInDays: 30
+          - Id: expire-build-sources
+            Status: Enabled
+            Prefix: source/
+            ExpirationInDays: 14
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: project
+          Value: inspectagent
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackPrefix}-table'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: false  # false = AWS owned key (encryption at rest is always on)
+      Tags:
+        - Key: project
+          Value: inspectagent
+
+  # --------------------------------------------------------------------------------------------
+  # Container registry + native image builds (CodeBuild ARM for Graviton, x86 for the comparison).
+  # --------------------------------------------------------------------------------------------
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Ref StackPrefix
+      EmptyOnDelete: true
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"Keep only the 10 most recent images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},
+          "action":{"type":"expire"}}]}
+      Tags:
+        - Key: project
+          Value: inspectagent
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${StackPrefix}'
+      RetentionInDays: 14
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: InspectAgent image builds - read the source zip, push to the stack's ECR repository, write build logs.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackPrefix}'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackPrefix}:*'
+              - Sid: ReadSourceZip
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${ArtifactBucket.Arn}/source/*'
+              - Sid: SourceBucketMetadata
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketAcl
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPushPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeImages
+                Resource: !GetAtt Repository.Arn
+              - Sid: EcrPublicAuthenticatedPulls
+                Effect: Allow
+                Action:
+                  - ecr-public:GetAuthorizationToken
+                  - sts:GetServiceBearerToken
+                Resource: '*'
+
+  BuildProjectArm64:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackPrefix}-build-arm64'
+      Description: Builds the InspectAgent Lambda image natively on Graviton (linux/arm64).
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: S3
+        Location: !Sub '${ArtifactBucket}/source/latest.zip'
+        BuildSpec: deploy/aws/buildspec.yml
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: !Ref BuildComputeType
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URI
+            Value: !GetAtt Repository.RepositoryUri
+          - Name: ECR_REPO_NAME
+            Value: !Ref Repository
+          - Name: TARGET_ARCH
+            Value: arm64
+          - Name: DOCKER_PLATFORM
+            Value: linux/arm64
+          - Name: TAG_SUFFIX
+            Value: ''
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+          StreamName: arm64
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 60
+      Tags:
+        - Key: project
+          Value: inspectagent
+
+  BuildProjectX86:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackPrefix}-build-x86_64'
+      Description: Builds the same image for x86_64 (Graviton-vs-x86 comparison function).
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: S3
+        Location: !Sub '${ArtifactBucket}/source/latest.zip'
+        BuildSpec: deploy/aws/buildspec.yml
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref BuildComputeType
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URI
+            Value: !GetAtt Repository.RepositoryUri
+          - Name: ECR_REPO_NAME
+            Value: !Ref Repository
+          - Name: TARGET_ARCH
+            Value: x86_64
+          - Name: DOCKER_PLATFORM
+            Value: linux/amd64
+          - Name: TAG_SUFFIX
+            Value: '-x86_64'
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+          StreamName: x86_64
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 60
+      Tags:
+        - Key: project
+          Value: inspectagent
+
+  # --------------------------------------------------------------------------------------------
+  # Lambda runtime: least-privilege execution role, log groups, functions, public Function URLs.
+  # --------------------------------------------------------------------------------------------
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StackPrefix}'
+      RetentionInDays: 14
+
+  FunctionLogGroupX86:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StackPrefix}-x86'
+      RetentionInDays: 14
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: InspectAgent Lambda execution role (logs, S3 traces/artifacts, DynamoDB table, Bedrock invoke).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-x86:*'
+              - Sid: TracesAndArtifactsObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${ArtifactBucket.Arn}/traces/*'
+                  - !Sub '${ArtifactBucket.Arn}/artifacts/*'
+              - Sid: ListTracesAndArtifacts
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArtifactBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - traces/*
+                      - artifacts/*
+              - Sid: TableCrud
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:ConditionCheckItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt Table.Arn
+                  - !Sub '${Table.Arn}/index/*'
+        - !If
+          - HasBedrock
+          - PolicyName: bedrock
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                # The Converse API is authorized by bedrock:InvokeModel (ConverseStream by
+                # bedrock:InvokeModelWithResponseStream); there is no separate "bedrock:Converse" IAM action.
+                - Sid: InvokeFoundationModelsAndInferenceProfiles
+                  Effect: Allow
+                  Action:
+                    - bedrock:InvokeModel
+                    - bedrock:InvokeModelWithResponseStream
+                  Resource:
+                    # Cross-region / global inference profiles route to foundation models in other
+                    # regions (global profiles use a region-less ARN), hence the region wildcard.
+                    - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                    - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+                    - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:application-inference-profile/*'
+                # Read-only model discovery, used by the planner only when BedrockModelId is "auto"
+                # (these list actions do not support resource-level permissions).
+                - Sid: DiscoverModelsForAutoSelection
+                  Effect: Allow
+                  Action:
+                    - bedrock:ListFoundationModels
+                    - bedrock:ListInferenceProfiles
+                  Resource: '*'
+          - !Ref AWS::NoValue
+        - !If
+          - BedrockMarketplace
+          - PolicyName: bedrock-marketplace
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: AutoEnableMarketplaceModels
+                  Effect: Allow
+                  Action:
+                    - aws-marketplace:ViewSubscriptions
+                    - aws-marketplace:Subscribe
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      aws:CalledViaLast: bedrock.amazonaws.com
+          - !Ref AWS::NoValue
+
+  Function:
+    Type: AWS::Lambda::Function
+    Condition: HasImage
+    Properties:
+      FunctionName: !Ref StackPrefix
+      Description: InspectAgent API (FastAPI + Mangum) - OpenCV 5 agentic inspection on Graviton (arm64).
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Architectures: [arm64]
+      MemorySize: 3008
+      Timeout: 60
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      Role: !GetAtt FunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          INSPECTAGENT_STORAGE: aws
+          INSPECTAGENT_S3_BUCKET: !Ref ArtifactBucket
+          INSPECTAGENT_DDB_TABLE: !Ref Table
+          INSPECTAGENT_BEDROCK_MODEL_ID: !Ref BedrockModelId
+          INSPECTAGENT_PLANNER: rule
+          INSPECTAGENT_LOG_LEVEL: INFO
+          INSPECTAGENT_LOCAL_STORAGE_DIR: /tmp/inspectagent
+          INSPECTAGENT_DEPLOY_ARCH: arm64
+          INSPECTAGENT_STACK_NAME: !Ref AWS::StackName
+      Tags:
+        - Key: project
+          Value: inspectagent
+
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Condition: HasImage
+    Properties:
+      TargetFunctionArn: !GetAtt Function.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+      Cors:
+        AllowOrigins: ['*']
+        AllowMethods: ['*']
+        AllowHeaders: ['*']
+        MaxAge: 300
+
+  FunctionUrlPublicInvokeUrl:
+    Type: AWS::Lambda::Permission
+    Condition: HasImage
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  FunctionUrlPublicInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Condition: HasImage
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  FunctionX86:
+    Type: AWS::Lambda::Function
+    Condition: HasX86Image
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-x86'
+      Description: InspectAgent API on x86_64 - identical image built for the Graviton-vs-x86 comparison.
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUriX86
+      Architectures: [x86_64]
+      MemorySize: 3008
+      Timeout: 60
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      Role: !GetAtt FunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroupX86
+        LogFormat: Text
+      Environment:
+        Variables:
+          INSPECTAGENT_STORAGE: aws
+          INSPECTAGENT_S3_BUCKET: !Ref ArtifactBucket
+          INSPECTAGENT_DDB_TABLE: !Ref Table
+          INSPECTAGENT_BEDROCK_MODEL_ID: !Ref BedrockModelId
+          INSPECTAGENT_PLANNER: rule
+          INSPECTAGENT_LOG_LEVEL: INFO
+          INSPECTAGENT_LOCAL_STORAGE_DIR: /tmp/inspectagent
+          INSPECTAGENT_DEPLOY_ARCH: x86_64
+          INSPECTAGENT_STACK_NAME: !Ref AWS::StackName
+      Tags:
+        - Key: project
+          Value: inspectagent
+
+  FunctionUrlX86:
+    Type: AWS::Lambda::Url
+    Condition: HasX86Image
+    Properties:
+      TargetFunctionArn: !GetAtt FunctionX86.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+      Cors:
+        AllowOrigins: ['*']
+        AllowMethods: ['*']
+        AllowHeaders: ['*']
+        MaxAge: 300
+
+  FunctionUrlX86PublicInvokeUrl:
+    Type: AWS::Lambda::Permission
+    Condition: HasX86Image
+    Properties:
+      FunctionName: !Ref FunctionX86
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  FunctionUrlX86PublicInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Condition: HasX86Image
+    Properties:
+      FunctionName: !Ref FunctionX86
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  FunctionUrl:
+    Condition: HasImage
+    Description: Public HTTPS endpoint of the arm64 (Graviton) function - UI at /, health at /healthz.
+    Value: !GetAtt FunctionUrl.FunctionUrl
+  FunctionName:
+    Condition: HasImage
+    Description: arm64 Lambda function name.
+    Value: !Ref Function
+  FunctionUrlX86:
+    Condition: HasX86Image
+    Description: Public HTTPS endpoint of the x86_64 comparison function.
+    Value: !GetAtt FunctionUrlX86.FunctionUrl
+  FunctionNameX86:
+    Condition: HasX86Image
+    Description: x86_64 Lambda function name.
+    Value: !Ref FunctionX86
+  BucketName:
+    Description: S3 bucket for traces/, artifacts/ and build sources (source/).
+    Value: !Ref ArtifactBucket
+  TableName:
+    Description: DynamoDB single table (pk/sk) for traces and review items.
+    Value: !Ref Table
+  RepoUri:
+    Description: ECR repository URI for the container images.
+    Value: !GetAtt Repository.RepositoryUri
+  RepoName:
+    Description: ECR repository name.
+    Value: !Ref Repository
+  ProjectName:
+    Description: CodeBuild project building the arm64 image (ARM_CONTAINER).
+    Value: !Ref BuildProjectArm64
+  ProjectNameX86:
+    Description: CodeBuild project building the x86_64 image (LINUX_CONTAINER).
+    Value: !Ref BuildProjectX86
+  BuildLogGroupName:
+    Description: CloudWatch log group of the image builds.
+    Value: !Ref BuildLogGroup

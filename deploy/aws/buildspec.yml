@@ -1,0 +1,82 @@
+# CodeBuild: build the InspectAgent Lambda container image natively for the project's architecture
+# (ARM_CONTAINER -> linux/arm64 for Graviton, LINUX_CONTAINER -> linux/amd64 for the x86 comparison)
+# and push it to the stack's ECR repository.
+#
+# Variables provided by the CodeBuild project (deploy/aws/template.yaml):
+#   ECR_REPO_URI, ECR_REPO_NAME, TARGET_ARCH (arm64|x86_64), DOCKER_PLATFORM (linux/arm64|linux/amd64), TAG_SUFFIX
+# Variables overridden per build by deploy/aws/deploy.py:
+#   IMAGE_TAG  content hash of the source zip (src-<sha256[:12]>), GIT_SHA  short commit id (or "unknown")
+# Tags pushed: <IMAGE_TAG><TAG_SUFFIX>, <GIT_SHA><TAG_SUFFIX> (when known) and latest<TAG_SUFFIX>.
+#
+# Buildspec 0.2 runs every command of every phase in the same shell, so exported variables persist.
+# A non-zero exit status of any command fails the phase.
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    DOCKERFILE: deploy/Dockerfile.lambda
+    IMAGE_TAG: ""
+    GIT_SHA: "unknown"
+    TAG_SUFFIX: ""
+    DOCKER_PLATFORM: "linux/arm64"
+    TARGET_ARCH: "arm64"
+  exported-variables:
+    - IMAGE_URI
+    - IMAGE_DIGEST
+
+phases:
+  pre_build:
+    commands:
+      - echo "Build host $(uname -m), target ${TARGET_ARCH} (${DOCKER_PLATFORM})"
+      - test -n "${ECR_REPO_URI}"
+      - test -f "${DOCKERFILE}"
+      - test -f requirements.lock.txt
+      - export AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION}}"
+      - export ECR_REGISTRY="${ECR_REPO_URI%%/*}"
+      - aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+      # Authenticated pulls from ECR Public (base image) get higher rate limits; anonymous pulls still work.
+      - aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws || echo "ECR Public login failed - continuing with anonymous pulls"
+      - |
+        if [ -z "${IMAGE_TAG}" ]; then
+          IMAGE_TAG="src-$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-${CODEBUILD_BUILD_NUMBER:-manual}}" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-40)"
+        fi
+        export IMAGE_TAG
+        export SAFE_GIT_SHA="$(printf '%s' "${GIT_SHA}" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-40)"
+      # Docker reads .dockerignore from the build-context root; the canonical copy lives in deploy/.
+      - cp -f deploy/.dockerignore .dockerignore
+      # Empty directories may be missing after the source zip is extracted; the Dockerfile copies them.
+      - mkdir -p models samples results scripts
+      - |
+        # Lambda rejects OCI image indexes carrying provenance attestations: disable them under BuildKit/buildx.
+        if docker buildx version >/dev/null 2>&1; then
+          export DOCKER_BUILDKIT=1
+          export BUILD_FLAGS="--provenance=false"
+        else
+          export BUILD_FLAGS=""
+        fi
+      - echo "Image tag ${IMAGE_TAG}${TAG_SUFFIX} (git ${SAFE_GIT_SHA})"
+  build:
+    commands:
+      - |
+        TAGS=(-t "${ECR_REPO_URI}:${IMAGE_TAG}${TAG_SUFFIX}" -t "${ECR_REPO_URI}:latest${TAG_SUFFIX}")
+        if [ "${SAFE_GIT_SHA}" != "unknown" ] && [ -n "${SAFE_GIT_SHA}" ]; then
+          TAGS+=(-t "${ECR_REPO_URI}:${SAFE_GIT_SHA}${TAG_SUFFIX}")
+        fi
+        docker build ${BUILD_FLAGS} --pull --platform "${DOCKER_PLATFORM}" \
+          --build-arg GIT_SHA="${SAFE_GIT_SHA}" --build-arg IMAGE_TAG="${IMAGE_TAG}${TAG_SUFFIX}" \
+          -f "${DOCKERFILE}" "${TAGS[@]}" .
+      # Fail fast if the image cannot import OpenCV/numpy on this architecture.
+      - docker run --rm --platform "${DOCKER_PLATFORM}" --entrypoint python "${ECR_REPO_URI}:${IMAGE_TAG}${TAG_SUFFIX}" -c "import platform, cv2, numpy; print('image ok', platform.machine(), cv2.__version__, numpy.__version__)"
+  post_build:
+    commands:
+      - test "${CODEBUILD_BUILD_SUCCEEDING}" = "1"
+      - docker push "${ECR_REPO_URI}:${IMAGE_TAG}${TAG_SUFFIX}"
+      - docker push "${ECR_REPO_URI}:latest${TAG_SUFFIX}"
+      - |
+        if [ "${SAFE_GIT_SHA}" != "unknown" ] && [ -n "${SAFE_GIT_SHA}" ]; then
+          docker push "${ECR_REPO_URI}:${SAFE_GIT_SHA}${TAG_SUFFIX}"
+        fi
+      - export IMAGE_DIGEST="$(aws ecr describe-images --repository-name "${ECR_REPO_NAME}" --image-ids imageTag="${IMAGE_TAG}${TAG_SUFFIX}" --query 'imageDetails[0].imageDigest' --output text)"
+      - export IMAGE_URI="${ECR_REPO_URI}@${IMAGE_DIGEST}"
+      - echo "Pushed ${IMAGE_URI}"

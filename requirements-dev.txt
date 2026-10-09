@@ -1,0 +1,8 @@
+# Development / evaluation / media dependencies (pinned)
+-r requirements.txt
+pytest==9.1.1
+httpx==0.28.1
+matplotlib==3.11.2
+playwright==1.63.0
+imageio-ffmpeg==0.6.0
+onnx==1.23.2
